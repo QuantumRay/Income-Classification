@@ -1,0 +1,965 @@
+---
+title: "Income Classification"
+author: "Spiridon Zarkov"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+# Introduction
+
+This case study will focus on modeling of a data series in order to create a classifier which is capable of accurately identifying individuals whose salary exceeds 50,000 USD. The data contains demographic information such as age, gender, education level and
+employment type. This report will describe the work carried out during the iterative process of data preparation, modelling and evaluation.
+
+### Data Understanding
+
+The data set used has 199523 rows and 42 features and a binomial label indicating a salary of less or greater than 50,000 USD, which for brevity will now be classified as `1` if over 50,000 and `0` if under 50,000 USD. The data set we will use for our analysis is 2/3 of the total data provided and a separate file containing the remaining 1/3 will be used in the end for testing.
+
+### Preparing the R session
+```{r message=FALSE, warning=FALSE, results=FALSE}
+# Import as needed
+library(tidyverse)
+library(pcaGoPromoter)
+library(data.table)
+library(caret)
+library(mice)
+library(DMwR)
+library(ggplot2)
+library(ggrepel)
+library(matrixStats)
+library(doParallel)
+library(knitr)
+library(kableExtra)
+options(knitr.table.format = "html") 
+```
+
+Import Data
+```{r}
+# Set Path
+path <- "C:\\Users\\spiridon.zarkov\\Desktop\\Census Data\\census_income_learn.csv"
+# Load in Data
+train <- fread(path, header = FALSE, stringsAsFactors = TRUE)
+```
+
+As the data is all anonymized it would be better if we name each column using the information provided in our metadata file.
+```{r}
+# Assign Column Names from Metadata
+colnames(train) <- c(
+ "age",	"class_worker",				
+ "ind_code",					
+ "occ_code",			
+ "education",					
+ "wage_per_hour",					
+ "hs_college",			
+ "marital_stat",				
+ "major_ind_code",				
+ "major_occ_code",				
+ "race",						
+ "hisp_origin",				
+ "sex",						
+ "union_member",			
+ "unemp_reason",		
+ "full_or_part_emp",
+ "capital_gains",					
+ "capital_losses",				
+ "divdends_from_stocks",				
+ "tax_filer_stat",			
+ "region_prev_res",		
+ "state_prev_res",			
+ "detailed_household_family_stat",	
+ "detailed_household_summary_household",	
+ "instance_weight",				
+ "migration_code_msa",			
+ "migration_code_reg",		
+ "migration_code_move_reg",		
+ "lived_here_last_year",		
+ "migration_prev_sunbelt",			
+ "num_emp",		
+ "fam_under_18",	
+ "country_father",			
+ "country_mother",	
+ "country_self",				
+ "citizenship",	
+ "own_or_self",
+ "vet_question",
+ "vet_benefits",
+ "weeks_worked",				
+ "year",		
+ "income"	
+)
+```
+
+Converting our `Income` variable to `1` if over 50,000 and `0` if under 50,000 USD
+```{r}
+# Convert Income to Class 1 if > 50,000 and 0 if less
+train$class <- ifelse(train$income == "50000+.", 1, 0)
+train$class <- as.factor(train$class)
+
+# Own or Self is a factor (0, 2, 1)
+train$own_or_self <- as.factor(train$own_or_self)
+
+# Copy Train dataset to play around with
+train_na <- train
+train_na[train_na == "?"] <- NA
+```
+
+### Exploratory Data Analysis (EDA)
+In order to decide, which features to use in the final data set for modeling, we want to get a feel for our data. And a good way to do this, is by creating different visualizations. It also helps with assessing your models later on, because to closer you are acquainted with the data’s properties, the better you’ll be able to pick up on things that might have gone wrong in your analysis (think of it as a kind of sanity-check for your data).
+
+As usual, I want to get acquainted with the data and explore it’s properties before I begin building any model. So, I am first going to look at the distribution of target classes. We have a clear class imbalance. Over 93% of our observations are of class 0 whilst only 6% are of class 1. This will cause problems for our classifier when we begin modeling and will need to be address before that.
+```{r, fig.align= "left", fig.width=4, fig.height=3}
+# Create a custom plotting "theme"
+my_theme <- function(base_size = 12, base_family = "sans"){
+  theme_minimal(base_size = base_size, base_family = base_family) +
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      panel.grid.major = element_line(color = "grey"),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "aliceblue"),
+      strip.background = element_rect(fill = "darkgrey", color = "grey", size = 1),
+      strip.text = element_text(face = "bold", size = 12, color = "white"),
+      legend.position = "right",
+      legend.justification = "top", 
+      panel.border = element_rect(color = "grey", fill = NA, size = 0.5)
+    )
+}
+
+# Examine the class distributuon
+# Y Axis = Count, Text = Percentage
+ggplot(train_na, aes(x = class, fill = class)) +
+        geom_bar(alpha = 0.9) +
+        geom_text(stat='count', aes(label = round((..count..)/sum(..count..)*100, 2))) +
+        my_theme()
+```
+
+How much data is missing?    
+  1. Some variables show close to 50% of their data missing. In this case we can either recode the "?" to a factor level or we can drop the column entirely. We have to examine our data further before deciding on an action.  
+  2. The variables that have under 10% missing data are usually good candidates for imputation.   
+```{r fig.width=10, fig.height=7}
+missing_values <- train_na %>% summarise_all(funs(sum(is.na(.))/n()))
+missing_values <- gather(missing_values, key = "feature", value = "missing_pct")
+missing_values %>%
+  ggplot(aes(x = reorder(feature, - missing_pct), y = missing_pct)) +
+  geom_bar(stat = "identity", fill = "lightseagreen", alpha = 0.9) +
+  coord_flip() +
+  my_theme() +
+  labs(y = "Features", x = "Missing Percent")
+```
+
+We then extract the variables that have under 10% missing data and summarise them by their countries to get a total count.
+```{r message=FALSE, warning=FALSE, paged.print=FALSE, results=FALSE}
+# Extract missing values under 10%
+miss_names <- missing_values %>% 
+              filter(missing_pct > 0.01 & missing_pct < 0.1) %>% 
+              select(feature)
+
+# Group By Country and Summarise
+name_count <- train_na %>% 
+              gather() %>% 
+              filter(key == miss_names$feature) %>% 
+              group_by(value) %>% 
+              summarise(count = n()) %>% 
+              arrange(desc(count)) 
+```
+
+Approximately 90% of our observations come from the United States. We can safely impute here without worrying about introducing too much bias in our data.
+```{r, results='asis'}
+# Show only top results
+kable(head(name_count)) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left", font_size = 15)
+```
+
+I am also interested in how much the cases cluster in a Principal Component Analysis (PCA). We notice that the two groups are overlapping around the center. The `1` class also has significant points outside the cluster. If we want to give the cases that are very different from the rest a stronger weight, we can define a weight column where every sample outside the central PCA cluster will get a `2`. Then they will in effect be used twice in our model. This technique can help us with the class imbalance but for now we will not dig into it further.
+```{r}
+# Custom Plotting "Theme" for PCA
+pca_func <- function(pcaOutput2, group_name){
+  centroids <- aggregate(cbind(PC1, PC2) ~ groups, pcaOutput2, mean)
+  conf.rgn  <- do.call(rbind, lapply(unique(pcaOutput2$groups), function(t)
+    data.frame(groups = as.character(t),
+               ellipse(cov(pcaOutput2[pcaOutput2$groups == t, 1:2]),
+                       centre = as.matrix(centroids[centroids$groups == t, 2:3]),
+                       level = 0.95),
+               stringsAsFactors = FALSE)))
+  
+  plot <- ggplot(data = pcaOutput2, aes(x = PC1, y = PC2, group = groups, color = groups)) + 
+    geom_polygon(data = conf.rgn, aes(fill = groups), alpha = 0.2) +
+    geom_point(size = 2, alpha = 0.5) + 
+    labs(color = paste(group_name),
+         fill = paste(group_name),
+         x = paste0("PC1: ", round(pcaOutput$pov[1], digits = 2) * 100, "% variance"),
+         y = paste0("PC2: ", round(pcaOutput$pov[2], digits = 2) * 100, "% variance")) +
+    my_theme()
+  
+  return(plot)
+}
+
+# Keep only numeric
+train_numeric <- train_na %>% keep(is.numeric)
+
+# Apply PCA with Normalization
+pcaOutput <- pca(na.omit(t(train_numeric)), printDropped = FALSE, 
+                 scale = TRUE, center = TRUE)
+
+pcaOutput2 <- as.data.frame(pcaOutput$scores)
+
+# Plot Class
+pcaOutput2$groups <- train$class
+pca_func(pcaOutput2, group_name = "class")
+```
+
+I also want to know what the variance is within features.
+Features with low variance are less likely to strongly contribute to a differentiation between the two cases.
+```{r}
+# Extract Features and Variance only
+colvars <- data.frame(feature = colnames(train_numeric),
+                      variance = colVars(as.matrix(train_numeric)))
+
+# Keep only High Variance
+subset(colvars, variance > 50) %>%
+  mutate(feature = factor(feature, levels = colnames(train_numeric))) %>%
+  ggplot(aes(x = feature, y = variance)) +
+  geom_bar(stat = "identity", fill = "lightseagreen", alpha = 0.7) +
+  my_theme() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  theme(axis.text=element_text(size=9), 
+        axis.title=element_text(size=10,face="bold"))
+```
+
+### Outlier Detection 
+We will test for extreme observations within each numeric feature. Variables: Age, Wage_Per_hour, Capital Gains/Losses and Dividends look like good candidates for further analysis.
+```{r}
+# Assign Class to the Numeric Values
+train_numeric$class <- train$class
+
+# Test for Outliers within each numeric value per one row
+t(lapply(train_numeric[, -13], function(x) outliers::outlier(x)))
+```
+
+Lets examine the distributions of these features by class.    
+  1. `Capital Gains/Losses`, `Dividends` and `Wages` are all clustered around a mean of `0` with some extreme outliers.  
+  2. `Age` variable makes sense as we would expect people with low income to be younger and people with highest income to be around the age of `50` at their peak.    
+  3. `Ind/Occ Code` also makes sense that class 0 is dominant around 0 as it represents cases of "Children or Not in Universe" and they will be ones most likely to be making less income.  
+```{r, fig.height=7, fig.width=10}
+gather(train_numeric, x, y, age:divdends_from_stocks) %>%
+  ggplot(aes(x = y, color = class, fill = class)) +
+    geom_density(alpha = 0.3) +
+    facet_wrap( ~ x, scales = "free", ncol = 3) +
+    labs(x = "Features", y = "Density") +
+    my_theme()
+```
+
+Box-plots of features by class reveals significant outliers in `Capital Gains` as well as some observations in `Dividends` and `Wages`. We can also see that the mean of class `0` is lower in age than the mean of class `1`. 
+```{r, fig.height=7, fig.width=10}
+gather(train_numeric, x, y, age:divdends_from_stocks) %>%
+  ggplot(aes(y = y, x = class, color = class, fill = class)) +
+    geom_boxplot(alpha = 0.3) +
+    facet_wrap( ~ x, scales = "free", ncol = 3) +
+    labs(x = "Class", y = "Index") +
+    my_theme()
+```
+
+Declaring an observation as an outlier based on a just one feature could lead to unrealistic inferences. When you have to decide if an individual entity (represented by row or observation) is an extreme value or not, it better to collectively consider the features (X’s) that matter. 
+```{r message=FALSE, warning=FALSE, results=FALSE}
+# Build a Logistic Regression on the Numeric Values
+mod <- glm(class ~ ., family=binomial, data=train_numeric)
+```
+
+Plot Extreme Values based on Cooks Distance. In general use, those observations that have a cook’s distance greater than X times the mean may be classified as influential.
+```{r}
+# Calculate Cooks Distance
+cooksd <- cooks.distance(mod)
+
+# Make into Data Frame and Plot
+cooksd_frame <- as.data.frame(cooksd)
+ggplot(cooksd_frame, aes(y = cooksd, x = seq(1, length(cooksd)))) + 
+  geom_point(color = "steelblue2", alpha = 0.7) + 
+  geom_hline(aes(yintercept = 350*mean(cooksd, na.rm=T), color = "350 Mean")) +
+  labs(x = "Index", y = "Cooks Distance", color = "Border") +
+  my_theme()
+```
+
+Now lets find out the influential rows from the original data. If you extract and examine each influential row 1-by-1 (from below output), you will be able to reason out why that row turned out influential and deal with them accordingly. Generally, we have 3 options for dealing with outliers.  
+  1. Impute missing values by their Mean/Median  
+  2. Cap them at the IQR Range  
+  3. Classify them as NA and Predict on them  
+There is no strict better method for choosing one option over the other.
+```{r}
+# influential row numbers (54 Total)
+influential <- as.numeric(names(cooksd)[(cooksd > 350*mean(cooksd, na.rm=T))])  
+
+# Only relevant columns
+train_num <- train_numeric %>% select(age, wage_per_hour, capital_gains, capital_losses,
+                                      divdends_from_stocks)
+
+# influential observations
+# Again we see that "capital_gains" forms the majority of extreme outliers
+# We also have a few cases from Dividends and a few from Wages Per Hour
+kable(head(train_num[influential, ])) %>% 
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left", font_size = 15)
+```
+
+Setting outliers to NA based on our model analysis
+```{r}
+# Capital Gains Outlier to NA
+train$capital_gains        <- ifelse(train$capital_gains == 99999, NA, 
+                                     train$capital_gains)
+
+# Dividends Outlier to NA
+train$divdends_from_stocks <- ifelse(train$divdends_from_stocks > 25000, NA,
+                                     train$divdends_from_stocks)
+
+# Wage Per Hour Outlier to NA
+train$wage_per_hour        <- ifelse(train$wage_per_hour > 8000, NA, 
+                                     train$wage_per_hour)
+```
+
+Correlation Plot of Numeric Features. No feature has over 70% correlation with any others so there is no need to examine these further here.
+```{r, fig.height=7, fig.width=7}
+train_numeric %>% 
+  select(age:instance_weight) %>% 
+  cor(use = "complete.obs") %>% 
+  corrplot::corrplot(type="lower", order="hclust",
+                     tl.cex = 0.7, tl.col = "coral3",
+                     col = colorRampPalette(c("mediumpurple4","mediumpurple1","lightseagreen"))(100))
+```
+
+### Categorical Features 
+
+We will conduct a graphical analysis of most of our categorical features and conduct any transformations that are needed before modeling.  
+
+Transform integers that should be factors. 
+```{r}
+# Transform to Factors
+train$num_emp      <- as.factor(train$num_emp)
+train$vet_benefits <- as.factor(train$vet_benefits)
+train$weeks_worked <- as.factor(train$weeks_worked)
+train$year         <- as.factor(train$year)
+
+# Create factors only dataframe for analysis
+train_factors      <- train %>% keep(is.factor)
+```
+
+Here I will create two custom plotting functions to visualise my data.  
+```{r}
+# Custom Graph, Custom Axis
+my_bar <- function(i) {
+train_factors %>% 
+ggplot(aes(x = i, y = class, fill = class)) +
+  geom_bar(stat = "identity", alpha = 0.7) + 
+  labs(x = (deparse(substitute(i))), y = "Count") +
+  my_theme() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  theme(axis.text=element_text(size=9), 
+        axis.title=element_text(size=10,face="bold")) +
+  scale_color_manual(name = "", values = c("lightseagreen", 'mediumpurple'),
+                       labels = c("0", "1")) +
+  scale_fill_manual(values = c("lightseagreen", 'mediumpurple'))
+}
+
+# Custom Graph, Standard Axis
+my_bar_short <- function(i) {
+train_factors %>% 
+ggplot(aes(x = i, y = class, fill = class)) +
+  geom_bar(stat = "identity", alpha = 0.7) + 
+  labs(x = (deparse(substitute(i))), y = "Count") +
+  my_theme() +
+  scale_color_manual(name = "", values = c("lightseagreen", 'mediumpurple'),
+                       labels = c("0", "1")) +
+  scale_fill_manual(values = c("lightseagreen", 'mediumpurple'))
+}
+```
+
+Large split between "Private" and "Not in Universe".  
+```{r}
+my_bar(train_factors$class_worker)
+```
+
+Majority of our observations come from factor level "White".
+```{r, fig.align= "left", fig.width=5, fig.height=4}
+my_bar(train_factors$race)
+```
+
+The total observations of men and women are evenly split.  
+Males are also more likely to be high income earners.  
+```{r, fig.align= "left", fig.width=3, fig.height=3}
+my_bar_short(train_factors$sex)
+```
+
+The distributions are centered around two classes. We will factor married into one category.
+```{r}
+my_bar(train_factors$marital_stat)
+```
+
+All variants of married will become merely married from now on.
+```{r}
+train$marital_stat <- as.character(train$marital_stat)
+train$marital_stat <- if_else(train$marital_stat == "Married-civilian spouse present", "Married",
+                      if_else(train$marital_stat == "Married-A F spouse present", "Married", 
+                      if_else(train$marital_stat == "Married-spouse absent" , "Married", train$marital_stat)))
+train$marital_stat <- as.factor(train$marital_stat)
+```
+
+The two features `hs_college` and `education` contain very similar data. However, we can see that "hs_college"" shows a majority of its observations in "Not in Universe" even though "education" clearly shows us large observations with high school and bachelor level education. The integrity of "hs_college" is likely compromised and the heavy distribution of "Not in Universe" makes this feature useless to us.
+```{r, fig.align= "left", fig.width=6, fig.height=3}
+my_bar_short(train_factors$hs_college)
+```
+
+```{r, fig.height=7, fig.width=7}
+my_bar(train_factors$education)
+```
+
+High earners tend to be houseowners and spouses of houseowners
+```{r, fig.align= "left", fig.width=5, fig.height=5}
+my_bar(train_factors$detailed_household_summary_household)
+```
+
+#### Missing Distribution
+`Not in Universe` seem to be heavily distributed in some of our factors. This data may as well be `NA` or `Missing`. We will transform all "Not in universe" characters to NA and check how our total percent missing looks after this transformation. The graph now shows that some features are nearly 100% NA. We will drop all columns over 55% missing values as they add nothing to our classifier. Luckily, the remaining series all contain one factor level that makes up around 90% of the data. This allows us to convert all NA values to that one factor level, as to not lose the relevant data from other columns, and still maintain integrity of our data.
+```{r fig.width=10, fig.height=7}
+train_not <- train_na
+train_not[train_not == "Not in universe"] <- NA
+train_not[train_not == "?"] <- NA
+
+ma <- train_not %>% summarise_all(funs(sum(is.na(.))/n()))
+ma <- gather(ma, key = "feature", value = "missing_pct")
+ma %>%
+  ggplot(aes(x = reorder(feature, - missing_pct), y = missing_pct)) +
+  geom_bar(stat = "identity", fill = "lightseagreen", alpha = 0.9) +
+  coord_flip() +
+  my_theme() +
+  labs(y = "Features", x = "Not in Universe")
+```
+
+We drop all features above 55% missing. 
+```{r}
+# Filter 55% and Above
+ma_only <- ma %>% filter(missing_pct > 0.55)
+ma_only <- ma_only$feature
+
+# Drop all with missing percent 55% and above
+train <- train[, !(names(train) %in% ma_only), with = FALSE]
+```
+
+As the majority of observations outside of "Not in Universe" were "Nonmover", we will reclassify all "NA" to level "Nonmover". Additionally, we will reclassify Worker Class to "Private", Country Origins to USA, Hispanic Origins to "All Other" and Major Occ Code to "Other". This aggregation method is intended to be fast. My concern here would be in overfitting our data with too good predictors. 
+```{r}
+# All Not in Universe and ? turn into NA
+train[train == "Not in universe"] <- NA
+train[train == "?"] <- NA
+
+# Change all factors to character
+train <- train %>% mutate_if(is.factor, as.character)
+
+# If "NA" make into "Nonmover" 
+train$migration_code_move_reg <- ifelse(is.na(train$migration_code_move_reg), "Nonmover",
+                                        train$migration_code_move_reg)
+train$migration_code_msa      <- ifelse(is.na(train$migration_code_msa), "Nonmover",
+                                        train$migration_code_msa)
+train$migration_code_reg      <- ifelse(is.na(train$migration_code_reg), "Nonmover",
+                                        train$migration_code_reg)
+
+# If "NA" make into "Private"
+train$class_worker            <- ifelse(is.na(train$class_worker), "Private",
+                                        train$class_worker)
+
+# If "NA" make into "United States"
+train$country_father          <- ifelse(is.na(train$country_father), "United-States", 
+                                        train$country_father)
+train$country_mother          <- ifelse(is.na(train$country_mother), "United-States", 
+                                        train$country_mother)
+train$country_self            <- ifelse(is.na(train$country_self), "United-States", 
+                                        train$country_self)
+
+# If "NA" make into "All Other"
+train$hisp_origin             <- ifelse(is.na(train$hisp_origin), "All other", 
+                                        train$hisp_origin)
+
+# If "NA" make into "Other"
+train$major_occ_code          <- ifelse(is.na(train$major_occ_code), "Other", 
+                                        train$major_occ_code)
+
+# Change all characters back to factors
+train <- train %>% mutate_if(is.character, as.factor)
+
+```
+
+```{r eval=FALSE, include=FALSE}
+# Combine low frequency levels
+for(i in names(train)) {
+  rate <- 5/100
+  leveled <- names(which(prop.table(table(train[[i]])) < rate))
+  levels(train[[i]])[levels(train[[i]]) %in% leveled] <- "Grouped"
+}
+```
+
+#### Imputing Data
+Missing values are imputed with the mice package. MICE works by creating multiple imputations as compared to a single imputation (such as mean) takes care of uncertainty in missing values.
+```{r}
+# Features to impute
+train_cols <- c("wage_per_hour", "capital_gains", "divdends_from_stocks")
+
+# Impute missing data
+dataset_impute <- mice(train[, train_cols],  print = FALSE)
+train <- cbind(train[, !(names(train) %in% train_cols), drop = FALSE], mice::complete(dataset_impute, 1))
+```
+
+#### Imbalanced Class
+Conventional algorithms are often biased towards the majority class because their loss functions attempt to optimize quantities such as error rate, not taking the data distribution into consideration. In the worst case, minority examples are treated as outliers of the majority class and ignored. The learning algorithm simply generates a trivial classifier that classifies every example as the majority class.
+
+#### Handling Imbalanced Data
+Outline of useful appraoches listed approximately in order of effort:  
+
+  1. Do nothing. Sometimes we can train on the so-called natural (or stratified) distribution and sometimes it works without need for modification.  
+  2. Balance the training set in some way:  
+    * Oversample the minority class  
+    * Undersample the majority class  
+    * Synthesize new minority class  
+  3. Throw away minority examples and switch to an anomaly detection framework.    
+  
+For our case we will try to balance our class by using a "Synthetic Minority Oversampling Technique" system. The SMOTE algorithm creates artificial data based on feature space similarities from minority samples. We can say, it generates a random set of minority class observations to shift the classifier learning bias towards minority class. To generate artificial data, SMOTE uses bootstrapping and k-nearest neighbors. The reason for using SMOTE was to strike a balance between speed and simplest while still generating a model with the highest true positive and true negative rates.  
+```{r}
+# Apply SMOTE
+set.seed(9560)
+smote_train <- SMOTE(class ~ ., data  = train)                         
+```
+
+Plot new distribution  
+```{r, fig.align= "left", fig.width=4, fig.height=3}
+ggplot(smote_train, aes(x = class, fill = class)) +
+        geom_bar(alpha = 0.9) +
+        geom_text(stat='count', aes(label = round((..count..)/sum(..count..)*100, 2))) +
+        my_theme()
+```
+
+### Modeling
+Since I’ll be using the H2O Library I will convert from an R Dataframe to an H2O Dataframe and boot up the library. I will also tell it to use all my CPU cores and allocate 26GBs of RAM to boost performance.  
+```{r message=FALSE, warning=FALSE, results=FALSE}
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = "26G")
+h2o.no_progress()
+```
+
+Now we can use the h2o.splitFrame() function to split the data into training, validation and test data. Here, I am using 70% for training and 15% each for validation and testing. We could also just split the data into two sections, a training and test set but when we have sufficient samples, it is a good idea to evaluate model performance on an independent test set on top of training with a validation set. Because we can easily overfit a model, we want to get an idea about how generalizable it is - this we can only assess by looking at how well it works on previously unknown data.
+```{r}
+train_h2o <- as.h2o(smote_train)
+splits <- h2o.splitFrame(train_h2o, ratios = c(0.7, 0.15), seed = 1)
+
+train_h2o <- splits[[1]]
+valid_h2o <- splits[[2]]
+test_h2o  <- splits[[3]]
+
+response <- "class"
+features <- setdiff(colnames(train_h2o), c(response, "income"))
+
+# Define as Factor since we want to know if its a Click (1) or Not (0)
+train_h2o[,response] <- h2o.asfactor(train_h2o[,response])
+valid_h2o[,response] <- h2o.asfactor(valid_h2o[,response])
+test_h2o[,response]  <- h2o.asfactor(test_h2o[,response])
+```
+
+#### Generalized Linear Model
+
+The generalized linear model (GLM) is a flexible generalization of the ordinary linear regression that allows for response variables that have error distribution models other than a normal distribution. In our case, the "Binomial" family or Logistic regression will output a probability that the given input point belongs to a certain class (0 or 1). 
+The `h2o` library has a number of advantages for us. In this scenario, it will automatically normalize our numeric features and it will encode our categorical features.
+```{r message=FALSE, warning=FALSE, results=FALSE, cache= TRUE}
+glm_fit <- h2o.glm( x = features, 
+                    y = response, 
+                    training_frame = train_h2o,
+                    model_id = "glm_fit",
+                    validation_frame = valid_h2o, # Validation Frame
+                    family = "binomial",
+                    nfolds = 25,
+                    seed = 1,
+                    lambda_search = TRUE) # Auto tune l1/l2 parameter
+
+# Check Performance against Test Set
+glm_perf <- h2o.performance(model = glm_fit,
+                            newdata = test_h2o)
+```
+
+Performance Metrics
+```{r}
+h2o.mean_per_class_error(glm_perf); h2o.auc(glm_perf); h2o.confusionMatrix(glm_perf)
+```
+Variable Importance  
+We can see key levels that give us the most predictive power in our GLM model (education and Vietnam).
+```{r}
+glm_fit@model$standardized_coefficient_magnitudes
+```
+
+###Random Forest
+
+Random forest is an ensemble algorithm of a Decision Tree, meaning more than one model is made, and their results used together, the aim being to cope better with unseen situations (i.e.,
+to avoid overfitting).  The idea behind random forest is to have lots of trees. Then, when you use it to predict on new data, you give the new data to each of those trees and ask each for their prediction. Since its classification we choose the most popular answer.
+
+#### Tuning Parameters
+Control how big our Random Forest will be. We will build a quick and simplistic model.
+```{r}
+# Keeping things simple
+hyper_params <- list(
+                     ntrees = c(25, 50, 75, 100), # Max Tree Number
+                     max_depth = c(10, 20, 30), # Simplistic Model
+                     min_rows = c(1, 3, 5) # Training per Leaf
+                     )
+```
+
+Control the search criteria. We will run a quick search strategy instead of an exhaustive one of all parameter combinations and limit our runtime to stop if the performance metric hasn't increased for 5 consecutive rounds by 0.05 percent.
+```{r}
+search_criteria <- list(
+                        strategy = "RandomDiscrete", # Quick Search
+                        max_models = 50, # Max Models
+                        max_runtime_secs = 360, # Max Runtime
+                        stopping_rounds = 5, # Stopping Metric        
+                        stopping_metric = "mean_per_class_error", # Metric     
+                        stopping_tolerance = 0.0005, # Stopping Metric
+                        seed = 42
+                        )
+```
+
+Build the model  
+```{r message=FALSE, warning=FALSE, results=FALSE, cache= TRUE}
+rf_grid <- h2o.grid(algorithm = "randomForest",
+                    x = features,
+                    y = response,
+                    grid_id = "rf_grid",
+                    training_frame = train_h2o,
+                    validation_frame = valid_h2o,
+                    nfolds = 25,                           
+                    fold_assignment = "Stratified",
+                    hyper_params = hyper_params,
+                    search_criteria = search_criteria,
+                    seed = 42
+                    )
+# Get Best Model
+rf_gridperf  <- h2o.getGrid(grid_id = "rf_grid", 
+                             sort_by = "mean_per_class_error", 
+                             decreasing = FALSE)
+best_rf_model_id <- rf_gridperf@model_ids[[1]]
+best_rf <- h2o.getModel(best_rf_model_id)
+
+# Check performance against test set
+rf_perf <- h2o.performance(model = best_rf,
+                           newdata = test_h2o)
+```
+
+Variable Importance  
+The features Random Forest uses are different than the GLM model and we don't need to encode our factor levels.  
+```{r}
+h2o.varimp_plot(best_rf)
+```
+
+Training and Validation AUC increase for number of trees. Useful to check if we are overfitting or underfitting our with the validation frame. Looks like we can gain a slight performance improvement if we run our model a little longer on more trees.
+```{r}
+plot(best_rf,
+     timestep = "number_of_trees",
+     metric = "logloss")
+```
+
+Our RF model slightly outperformed our GLM model. Though the difference is small, RF is more robust and building a more complex model with more trees will likely widen this gap.
+```{r}
+h2o.mean_per_class_error(rf_perf); h2o.auc(rf_perf); h2o.confusionMatrix(rf_perf)
+```
+
+Plotting our predictions is the best way to understand our model. 
+```{r}
+finalRf_predictions <- data.frame(actual = as.vector(test_h2o$class), 
+                                  as.data.frame(h2o.predict(object = best_rf, 
+                                                            newdata = test_h2o)))
+
+finalRf_predictions$accurate <- ifelse(finalRf_predictions$actual == 
+                                         finalRf_predictions$predict, "Yes", "No")
+
+finalRf_predictions %>%
+  ggplot(aes(x = actual, fill = accurate)) +
+  geom_bar(position = "dodge") +
+  my_theme() +
+  labs(fill = "Were\npredictions\naccurate?",
+       title = "Default predictions")
+```
+
+Once we are happy with a model. We can bring in the "Test" data we have and run our model against it to see how it will perform.
+
+### Special Note
+
+It is good to keep in that mind that we are testing our performance on a series that has been synthesized to have a class balance. If we did not have our "other" test set we should have rather made the split before applying "SMOTE" and test our performance against an imbalanced set to see if our model was able to learn the data well enough. In that case, our iterative process would have started from there and not moved on to our next stage.
+
+### Testing Model
+
+Import Test Data
+```{r}
+# Set Path
+path_test <- "C:\\Users\\spiridon.zarkov\\Desktop\\Census Data\\census_income_test.csv"
+# Load in Data
+test <- fread(path_test, header = FALSE, stringsAsFactors = TRUE)
+```
+
+Now we have to perform some transformations on our test data similar to our train features in order to model them. Lets have a glimpse at our test dataset after transformation.  
+```{r include=FALSE}
+# Assign Column Names from Metadata
+colnames(test) <- c(
+  "age",	"class_worker",				
+  "ind_code",					
+  "occ_code",			
+  "education",					
+  "wage_per_hour",					
+  "hs_college",			
+  "marital_stat",				
+  "major_ind_code",				
+  "major_occ_code",				
+  "race",						
+  "hisp_origin",				
+  "sex",						
+  "union_member",			
+  "unemp_reason",		
+  "full_or_part_emp",
+  "capital_gains",					
+  "capital_losses",				
+  "divdends_from_stocks",				
+  "tax_filer_stat",			
+  "region_prev_res",		
+  "state_prev_res",			
+  "detailed_household_family_stat",	
+  "detailed_household_summary_household",	
+  "instance_weight",				
+  "migration_code_msa",			
+  "migration_code_reg",		
+  "migration_code_move_reg",		
+  "lived_here_last_year",		
+  "migration_prev_sunbelt",			
+  "num_emp",		
+  "fam_under_18",	
+  "country_father",			
+  "country_mother",	
+  "country_self",				
+  "citizenship",	
+  "own_or_self",
+  "vet_question",
+  "vet_benefits",
+  "weeks_worked",				
+  "year",		
+  "income"	
+)
+
+# Convert Income to Class 1 if > 50,000 and 0 if less
+test$class <- ifelse(test$income == "50000+.", 1, 0)
+test$class <- as.factor(test$class)
+
+# Own or Self is a factor (0, 2, 1)
+test$own_or_self <- as.factor(test$own_or_self)
+
+# Capital Gains Outlier to NA
+test$capital_gains        <- ifelse(test$capital_gains == 99999, NA, 
+                                    test$capital_gains)
+
+# Dividends Outlier to NA
+test$divdends_from_stocks <- ifelse(test$divdends_from_stocks > 25000, NA,
+                                    test$divdends_from_stocks)
+
+# Wage Per Hour Outlier to NA
+test$wage_per_hour        <- ifelse(test$wage_per_hour > 8000, NA, 
+                                    test$wage_per_hour)
+
+# Transform to Factors
+test$num_emp      <- as.factor(test$num_emp)
+test$vet_benefits <- as.factor(test$vet_benefits)
+test$weeks_worked <- as.factor(test$weeks_worked)
+test$year         <- as.factor(test$year)
+
+test_not <- test
+test_not[test_not == "Not in universe"] <- NA
+test_not[test_not == "?"] <- NA
+
+# Missing Values
+ta <- test_not %>% summarise_all(funs(sum(is.na(.))/n()))
+ta <- gather(ta, key = "feature", value = "missing_pct")
+ta_only <- ta %>% filter(missing_pct > 0.55)
+ta_only <- ta_only$feature
+
+# Drop all with missing percent 55% and above
+test <- test[, !(names(test) %in% ta_only), with = FALSE]
+
+# All Not in Universe and ? turn into NA
+test[test == "Not in universe"] <- NA
+test[test == "?"] <- NA
+
+# Change all factors to character
+test <- test %>% mutate_if(is.factor, as.character)
+
+# If "NA" make into "Nonmover" 
+test$migration_code_move_reg <- ifelse(is.na(test$migration_code_move_reg), "Nonmover",
+                                       test$migration_code_move_reg)
+test$migration_code_msa      <- ifelse(is.na(test$migration_code_msa), "Nonmover",
+                                       test$migration_code_msa)
+test$migration_code_reg      <- ifelse(is.na(test$migration_code_reg), "Nonmover",
+                                       test$migration_code_reg)
+
+# If "NA" make into "Private"
+test$class_worker            <- ifelse(is.na(test$class_worker), "Private",
+                                       test$class_worker)
+
+# If "NA" make into "United States"
+test$country_father          <- ifelse(is.na(test$country_father), "United-States", 
+                                       test$country_father)
+test$country_mother          <- ifelse(is.na(test$country_mother), "United-States", 
+                                       test$country_mother)
+test$country_self            <- ifelse(is.na(test$country_self), "United-States", 
+                                       test$country_self)
+
+# If "NA" make into "All Other"
+test$hisp_origin             <- ifelse(is.na(test$hisp_origin), "All other", 
+                                        test$hisp_origin)
+
+# If "NA" make into "Other"
+test$major_occ_code          <- ifelse(is.na(test$major_occ_code), "Other", 
+                                        test$major_occ_code)
+
+# Change all characters back to factors
+test <- test %>% mutate_if(is.character, as.factor)
+
+# Features to impute
+test_cols <- c("wage_per_hour", "capital_gains", "divdends_from_stocks")
+
+# Impute missing data
+dataset_impute_test <- mice(test[, test_cols],  print = FALSE)
+test <- cbind(test[, !(names(test) %in% test_cols), drop = FALSE], mice::complete(dataset_impute_test, 1))
+
+test <- test %>% select(-income)
+```
+
+Glimpse at our test series  
+```{r}
+glimpse(test)
+```
+
+Lets check the class distribution of our test series  
+```{r, fig.align= "left", fig.width=4, fig.height=3}
+ggplot(test, aes(x = class, fill = class)) +
+        geom_bar(alpha = 0.9) +
+        geom_text(stat='count', aes(label = round((..count..)/sum(..count..)*100, 2))) +
+        my_theme()
+```
+
+Convert our test and train sets to h2o frames.
+```{r message=FALSE, warning=FALSE, results=FALSE}
+train_h2o <- as.h2o(smote_train)
+test_h2o  <- as.h2o(test)
+splits    <- h2o.splitFrame(train_h2o, ratios = c(0.85), seed = 1)
+
+# Two splits not three now as we already have our test set
+train_h2o <- splits[[1]]
+valid_h2o <- splits[[2]]
+
+response <- "class"
+features <- setdiff(colnames(train_h2o), c(response, "income"))
+
+# Define as Factor since we want to know if its a Click (1) or Not (0)
+train_h2o[,response] <- h2o.asfactor(train_h2o[,response])
+valid_h2o[,response] <- h2o.asfactor(valid_h2o[,response])
+test_h2o[,response]  <- h2o.asfactor(test_h2o[,response])
+```
+
+Build the Random Forest model.  
+```{r message=FALSE, warning=FALSE, results=FALSE, cache= TRUE}
+# Hyper Parameters
+hyper_params <- list(
+                     ntrees = c(25, 50, 75, 100), # Max Tree Number
+                     max_depth = c(10, 20, 30), # Simplistic Model
+                     min_rows = c(1, 3, 5) # Training per Leaf
+                     )
+# Search Parameters
+search_criteria <- list(
+                        strategy = "RandomDiscrete", # Quick Search
+                        max_models = 50, # Max Models
+                        max_runtime_secs = 360, # Max Runtime
+                        stopping_rounds = 5, # Stopping Metric        
+                        stopping_metric = "mean_per_class_error", # Metric     
+                        stopping_tolerance = 0.0005, # Stopping Metric
+                        seed = 42
+                        )
+# Random Forest Model
+rf_final <- h2o.grid(algorithm = "randomForest",
+                    x = features,
+                    y = response,
+                    grid_id = "rf_final",
+                    training_frame = train_h2o,
+                    validation_frame = valid_h2o,
+                    nfolds = 25,                           
+                    fold_assignment = "Stratified",
+                    hyper_params = hyper_params,
+                    search_criteria = search_criteria,
+                    seed = 42
+                    )
+# Get Best Model
+rf_gridfinal  <- h2o.getGrid(grid_id = "rf_final", 
+                             sort_by = "mean_per_class_error", 
+                             decreasing = FALSE)
+rf_model_final <- rf_gridfinal@model_ids[[1]]
+best_rf_final <- h2o.getModel(rf_model_final)
+
+# Check performance against test set
+rf_perf <- h2o.performance(model = best_rf_final,
+                           newdata = test_h2o)
+```
+
+Predictions of our final results.   
+```{r message=FALSE, warning=FALSE, results = FALSE}
+finalRf_predictions <- data.frame(actual = as.vector(test_h2o$class), 
+                                  as.data.frame(h2o.predict(object = best_rf_final, 
+                                                            newdata = test_h2o)))
+
+finalRf_predictions$accurate <- ifelse(finalRf_predictions$actual == 
+                                         finalRf_predictions$predict, "Yes", "No")
+```
+
+Plot Predictions  
+```{r message=FALSE, warning=FALSE}
+finalRf_predictions %>%
+  ggplot(aes(x = actual, fill = accurate)) +
+  geom_bar(position = "dodge") +
+  my_theme() +
+  labs(fill = "Were\npredictions\naccurate?",
+       title = "Default predictions")
+```
+
+### Summary
+
+Our model was not able to generalize well to the data. We only correctly classified around 60% of our `Class 1` on a 50% probability basis. However, as Data Science is an iterative process and we passed only one step of it we can go back and take corrective action to improve our model.
+
+Suggested Actions:
+  1. Feature Engineering  
+    * How did we categorize missing values? Should we drop columns?  
+    * Can we create new features from our data? Binning/Differencing/etc.  
+  1.1 Overfitting  
+    * We should check our model on a "non synthesized" test set before moving on to next stage  
+  2. More Complex Model  
+    * We only did minor parameter tuning to get a fast model, going back and retuning may lead to better results.  
+    * Build a more complex model (XGBoost, Deep Learning, etc.)  
+  3. Test different sampling techniques  
+    * Test different sampling techniques (Over/Under/ROSE) and compare performance
+  4. Try Anomoly Detection Framework 
+    * We are quite close to being an anomoly detection case as we have limited rows and only 6% of one class. If we drop them to less than 1% we could start building an anomoly framework which might more accuractly predict the classes.  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
